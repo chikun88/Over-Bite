@@ -1,0 +1,29 @@
+# Local IDE configuration and caches
+.gradle/
+.kotlin/
+.idea/
+*.iml
+.claude/
+.artifacts/
+.cxx/
+.externalNativeBuild/
+# Machine-specific Android SDK and credentials
+local.properties
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+keystore.properties
+key.properties
+# Generated outputs
+**/build/
+*.apk
+*.aab
+*.apks
+*.log
+.DS_Store
+Thumbs.db
+# Internal machine-specific development logs
+NAVIGATION_*.md
+POSE_RESET_*.md

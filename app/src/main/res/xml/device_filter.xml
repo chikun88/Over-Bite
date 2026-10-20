@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 代表的なUSBシリアル変換IC。MU-3 USB基板のICに応じて追加してください。 -->
+    <!-- FTDI FT232R / MU-3 USB Board -->
+    <usb-device vendor-id="1027" product-id="24577" />
+    <!-- WCH CH340 / CH341 -->
+    <usb-device vendor-id="6790" product-id="29987" />
+    <!-- WCH CH9102 -->
+    <usb-device vendor-id="6790" product-id="21972" />
+    <!-- Silicon Labs CP210x -->
+    <usb-device vendor-id="4292" product-id="60000" />
+    <!-- Prolific PL2303 -->
+    <usb-device vendor-id="1659" product-id="8963" />
+    <!-- CDC ACM系 -->
+    <usb-device class="2" />
+</resources>
