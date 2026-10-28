@@ -15,8 +15,8 @@ android {
         applicationId = "com.chihaya.overbite2"
         minSdk = 23
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     // Java/Kotlin のコンパイルターゲットを 1.8 に統一する。

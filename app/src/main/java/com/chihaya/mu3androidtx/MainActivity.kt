@@ -10,6 +10,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Canvas
 import android.graphics.Color
@@ -946,7 +947,7 @@ class MainActivity : Activity() {
                 ellipsize = TextUtils.TruncateAt.END
             })
             titleStack.addView(TextView(context).apply {
-                text = "MU-3 LIVE CONTROL / LOW-LATENCY TX"
+                text = "MU-3 LIVE CONTROL / LOW-LATENCY TX  ·  $appVersionLabel"
                 textSize = 9.5f
                 typeface = Typeface.DEFAULT_BOLD
                 letterSpacing = 0.04f
@@ -954,6 +955,27 @@ class MainActivity : Activity() {
                 maxLines = 1
                 ellipsize = TextUtils.TruncateAt.END
             })
+        }
+    }
+
+    /** build.gradle.kts の versionName / versionCode。どのAPKが入っているかを画面で確認するため。 */
+    private val appVersionLabel: String by lazy {
+        try {
+            val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                packageManager.getPackageInfo(packageName, 0)
+            }
+            val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                info.longVersionCode
+            } else {
+                @Suppress("DEPRECATION")
+                info.versionCode.toLong()
+            }
+            "v${info.versionName} ($code)"
+        } catch (_: Exception) {
+            "v?"
         }
     }
 
@@ -2343,6 +2365,13 @@ class MainActivity : Activity() {
                     
                     val statusContent = LinearLayout(context).apply {
                         orientation = LinearLayout.VERTICAL
+                        addView(TextView(context).apply {
+                            text = "APP VERSION: $appVersionLabel"
+                            textSize = 12f
+                            typeface = Typeface.DEFAULT_BOLD
+                            setTextColor(colors.accentPrimary)
+                        })
+                        addSpace(6)
                         addView(infoBox(commStatusText))
                         addSpace(8)
                         addView(statusText)
