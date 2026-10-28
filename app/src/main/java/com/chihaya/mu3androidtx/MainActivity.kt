@@ -67,7 +67,6 @@ import java.nio.charset.StandardCharsets
 import java.util.Locale
 import kotlin.math.min
 import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -129,8 +128,6 @@ class MainActivity : Activity() {
     private val serialOpenBusy = AtomicBoolean(false)
     private val diagBusy = AtomicBoolean(false)
     private val neutralBurstBusy = AtomicBoolean(false)
-    private val senderExecutor = Executors.newSingleThreadScheduledExecutor()
-    private var sendTask: ScheduledFuture<*>? = null
     private var senderThread: Thread? = null
     private val senderGeneration = AtomicInteger(0)
     
@@ -431,7 +428,6 @@ class MainActivity : Activity() {
         mainHandler.removeCallbacks(telemetryRefresh)
         mainHandler.removeCallbacks(replayTick)
         mainHandler.removeCallbacks(aiTick)
-        senderExecutor.shutdownNow()
         diagExecutor.shutdownNow()
         (getSystemService(INPUT_SERVICE) as InputManager).unregisterInputDeviceListener(inputDeviceListener)
         try {
@@ -2000,19 +1996,6 @@ class MainActivity : Activity() {
                 (this as TextView).textSize = 10f
                 gravity = Gravity.CENTER
             })
-        }
-    }
-
-    private fun createFieldSideSelector(): View {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(smallButton("◀ 左フィールド", color("#0B57D0")) {
-                setSavedNavigationField(rightField = false)
-            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            addSpaceHorizontal(8)
-            addView(smallButton("右フィールド ▶", color("#0B57D0")) {
-                setSavedNavigationField(rightField = true)
-            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         }
     }
 
@@ -3782,212 +3765,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun createMu3TestTabLegacy(): View {
-        val rootScroll = ScrollView(this).apply {
-            isFillViewport = true
-            isVerticalScrollBarEnabled = false
-            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
-            setBackgroundColor(Color.TRANSPARENT)
-        }
-
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(16))
-
-            // --- Top Row: Status Displays ---
-            val statusRow = LinearLayout(context).apply {
-                orientation = LinearLayout.HORIZONTAL
-                
-                // RSSI / SN Display
-                val rssiCard = glassBox().apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(dp(16), dp(12), dp(16), dp(12))
-                    addView(sectionTitle("RADIO QUALITY", "電波強度・品質"))
-                    addSpace(8)
-                    mu3RssiText = monoText("WAITING...").apply { textSize = 11f }
-                    addView(infoBox(mu3RssiText).apply { minimumHeight = dp(60) })
-                }
-                
-                addSpaceHorizontal(12)
-
-                // Test Packet Result Display
-                val packetCard = glassBox().apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(dp(16), dp(12), dp(16), dp(12))
-                    addView(sectionTitle("TX TEST STATUS", "パケットテスト状況"))
-                    addSpace(8)
-                    mu3PacketText = monoText("READY").apply { textSize = 11f }
-                    addView(infoBox(mu3PacketText).apply { minimumHeight = dp(60) })
-                }
-                
-                addView(rssiCard, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-                addView(packetCard, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.2f))
-            }
-            addView(statusRow)
-            addSpace(16)
-
-            // --- Middle Row: Link Settings and Commands ---
-            val mainControls = LinearLayout(context).apply {
-                orientation = LinearLayout.HORIZONTAL
-                
-                // 1. Link Settings
-                val linkPane = glassBox().apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(dp(16), dp(12), dp(16), dp(12))
-                    addView(sectionTitle("LINK SETTINGS", "リンク・ID設定"))
-                    addSpace(8)
-                    
-                    linkUiInput = formInput("0000")
-                    linkGiInput = formInput("00")
-                    linkChInput = formInput("07")
-                    linkEiInput = formInput("01")
-                    linkDiInput = formInput("02")
-
-                    val form = LinearLayout(context).apply {
-                        orientation = LinearLayout.VERTICAL
-                        addView(mappingRow("UserID (UI)", "0000") { linkUiInput.requestFocus() }.apply { (this as LinearLayout).addView(linkUiInput, LinearLayout.LayoutParams(dp(70), dp(32))) })
-                        addView(mappingRow("Group (GI)", "00") { linkGiInput.requestFocus() }.apply { (this as LinearLayout).addView(linkGiInput, LinearLayout.LayoutParams(dp(70), dp(32))) })
-                        addView(mappingRow("Channel (CH)", "07") { linkChInput.requestFocus() }.apply { (this as LinearLayout).addView(linkChInput, LinearLayout.LayoutParams(dp(70), dp(32))) })
-                        addView(mappingRow("Own ID (EI)", "01") { linkEiInput.requestFocus() }.apply { (this as LinearLayout).addView(linkEiInput, LinearLayout.LayoutParams(dp(70), dp(32))) })
-                        addView(mappingRow("Target (DI)", "02") { linkDiInput.requestFocus() }.apply { (this as LinearLayout).addView(linkDiInput, LinearLayout.LayoutParams(dp(70), dp(32))) })
-                    }
-                    addView(form)
-                    addSpace(12)
-                    
-                    val linkGrid = GridLayout(context).apply { columnCount = 2 }
-                    linkGrid.addView(actionButton("READ", "一括取得", color("#00A8A8")) { readLinkParams() }, gridParams())
-                    linkGrid.addView(actionButton("APPLY", "一時適用", color("#00A86B")) { applyLinkParams(false) }, gridParams())
-                    linkGrid.addView(actionButton("SAVE/W", "ROM保存", color("#FFB300")) {
-                         AlertDialog.Builder(this@MainActivity)
-                            .setTitle("/Wで保存しますか？")
-                            .setMessage("MU-3のEEPROMにリンク設定を保存します。")
-                            .setPositiveButton("保存") { _, _ -> applyLinkParams(true) }
-                            .setNegativeButton("キャンセル", null)
-                            .show()
-                    }, gridParams())
-                    linkGrid.addView(actionButton("FAST", "FIXED", color("#34A853")) { applyFastPreset() }, gridParams())
-                    addView(linkGrid)
-                }
-
-                addSpaceHorizontal(12)
-
-                // 2. Command Palette
-                val commandPane = glassBox().apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(dp(16), dp(12), dp(16), dp(12))
-                    addView(sectionTitle("MU-3 COMMANDS", "コマンド操作"))
-                    addSpace(8)
-
-                    val customInputRow = LinearLayout(context).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                        gravity = Gravity.CENTER_VERTICAL
-                        mu3CommandInput = formInput("@GI")
-                        addView(mu3CommandInput, LinearLayout.LayoutParams(0, dp(40), 1f))
-                        addSpaceHorizontal(8)
-                        addView(smallButton("SEND", color("#00A86B")) { sendDiagCommand(mu3CommandInput.text.toString()) })
-                    }
-                    addView(customInputRow)
-                    addSpace(12)
-
-                    val quickGrid = GridLayout(context).apply { columnCount = 3 }
-                    val quickCommands = listOf(
-                        "@GI" to "INFO", "@VR" to "VER", "@UI" to "UserID",
-                        "@CH" to "CH", "@RA" to "RSSI", "@CR" to "S/N",
-                        "@IZ" to "RESET", "@DT" to "TEST", "WAKE" to "WAKE"
-                    )
-                    for ((cmd, label) in quickCommands) {
-                        quickGrid.addView(actionButton(label, cmd, color("#00A8A8")) {
-                            when(cmd) {
-                                "@IZ" -> AlertDialog.Builder(this@MainActivity)
-                                    .setTitle("MU-3を初期化しますか？")
-                                    .setMessage("@IZを送信します。")
-                                    .setPositiveButton("送信") { _, _ -> sendDiagCommand(cmd) }
-                                    .setNegativeButton("キャンセル", null).show()
-                                "@DT" -> runPacketTest(100)
-                                "WAKE" -> runWakeTest()
-                                else -> sendDiagCommand(cmd)
-                            }
-                        }, gridParams())
-                    }
-                    addView(quickGrid)
-                    
-                    addSpace(12)
-                    addView(actionButton("AUTO RECOVER", "通信ボーレート自動復旧", color("#FF6F61")) { autoRecoverMu3Response() })
-                }
-                
-                addView(linkPane, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.1f))
-                addView(commandPane, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.2f))
-            }
-            addView(mainControls)
-            addSpace(16)
-
-            // --- Bottom Section: Log and Scan ---
-            val bottomRow = LinearLayout(context).apply {
-                orientation = LinearLayout.HORIZONTAL
-                
-                // 1. Scan Panel
-                val scanPane = glassBox().apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(dp(16), dp(12), dp(16), dp(12))
-                    addView(sectionTitle("AIR SCAN", "簡易チャネルスキャン"))
-                    addSpace(8)
-                    val scanSetting = LinearLayout(context).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                        gravity = Gravity.CENTER_VERTICAL
-                        scanStartInput = formInput("02")
-                        scanEndInput = formInput("19")
-                        addView(TextView(context).apply { text = "RANGE"; textSize = 11f; setTextColor(colors.textSecondary) })
-                        addSpaceHorizontal(8)
-                        addView(scanStartInput, LinearLayout.LayoutParams(dp(44), dp(32)))
-                        addView(TextView(context).apply { text = "-"; setPadding(dp(4), 0, dp(4), 0); setTextColor(colors.textSecondary) })
-                        addView(scanEndInput, LinearLayout.LayoutParams(dp(44), dp(32)))
-                    }
-                    addView(scanSetting)
-                    addSpace(8)
-                    addView(actionButton("START SCAN", "@CH+@RA sequential", color("#FF6F61")) { runAirScan() })
-                    addSpace(12)
-                    addView(actionButton("NEUTRAL x10", "安全停止バースト", color("#F59E0B")) {
-                        stopSending()
-                        synchronized(pad) { pad.clearAll() }
-                        updateUiState()
-                        sendNeutralBurstAsync(10, "DIAG: NEUTRAL x10")
-                    })
-                }
-
-                addSpaceHorizontal(12)
-
-                // 2. Diag Log
-                val logPane = glassBox().apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(dp(16), dp(12), dp(16), dp(12))
-                    val logHeader = LinearLayout(context).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                        gravity = Gravity.CENTER_VERTICAL
-                        addView(sectionTitle("DIAG LOG", "通信ログ"), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-                        addView(smallButton("CLEAR", color("#64748B")) {
-                            mu3DiagLogBuffer.clear()
-                            if (::mu3DiagLogText.isInitialized) mu3DiagLogText.text = ""
-                        })
-                    }
-                    addView(logHeader)
-                    addSpace(8)
-                    mu3DiagLogText = monoText("MU-3 TEST READY").apply { textSize = 10f; setTextColor(colors.textSecondary) }
-                    addView(infoBox(mu3DiagLogText).apply { minimumHeight = dp(160) })
-                }
-                
-                addView(scanPane, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.8f))
-                addView(logPane, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.5f))
-            }
-            addView(bottomRow)
-        }
-
-        rootScroll.addView(android.widget.HorizontalScrollView(this).apply {
-            isFillViewport = true
-            addView(content)
-        })
-        return rootScroll
-    }
-
     private fun featureButtonGrid(): View {
         featureGrid = GridLayout(this).apply {
             columnCount = virtualButtonColumns()
@@ -4965,8 +4742,6 @@ class MainActivity : Activity() {
         // transmissionLoop は絶対時刻のデッドラインで待機し、遅れてもcatch-up連送をしないため、
         // 処理時間に依らず送信周期が一定になり、TX LEDが安定して点滅する
         // （最優先スレッドで動かしGCジッタも避ける）。
-        sendTask?.cancel(true)
-        sendTask = null
         val generation = senderGeneration.incrementAndGet()
         val thread = Thread { transmissionLoop(generation) }.apply {
             name = "mu3-tx"
@@ -4994,8 +4769,6 @@ class MainActivity : Activity() {
         // 送信が止まる＝自動操縦も必ず止める（緊急停止・一時停止・リンク障害すべてで安全側に倒す）。
         if (autopilotActive) stopAutopilotInternal(neutralize = false)
         isSending = false
-        sendTask?.cancel(true)
-        sendTask = null
         senderGeneration.incrementAndGet()
         val thread = senderThread
         thread?.interrupt()
@@ -5320,10 +5093,6 @@ class MainActivity : Activity() {
         return requestedMs.coerceIn(10L, 1000L)
     }
 
-    private fun minStableTxIntervalMs(): Long {
-        return 10L
-    }
-
     private fun enforceStableTxIntervalForBaud(): Boolean {
         txIntervalMs = stableTxIntervalMs(txIntervalMs)
         return false
@@ -5338,13 +5107,6 @@ class MainActivity : Activity() {
         val baud = currentBaudRate
         val wireMs = if (baud > 0) (((bits * 1000L) + baud - 1L) / baud).toInt() else 20
         return (wireMs + 20).coerceIn(25, 220)
-    }
-
-    private fun writeSerial(bytes: ByteArray, timeoutMs: Int = 300) {
-        synchronized(serialWriteLock) {
-            val port = serialPort ?: throw IllegalStateException("MU-3 disconnected")
-            port.write(bytes, timeoutMs)
-        }
     }
 
     private fun sendAsciiCommand(command: String, timeoutMs: Int = 900, retryOnNoResponse: Boolean = true): String {
