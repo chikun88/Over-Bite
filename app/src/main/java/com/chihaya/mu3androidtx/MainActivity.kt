@@ -24,6 +24,7 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.graphics.drawable.ShapeDrawable
 import android.graphics.drawable.shapes.RoundRectShape
+import android.hardware.input.InputManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
@@ -377,13 +378,30 @@ class MainActivity : Activity() {
             }
             if (intent.action != actionUsbPermission) return
 
-            val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+            val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false) ||
+                (device != null && usbManager.hasPermission(device))
             if (granted && device != null) {
                 openSerialForDeviceAsync(device)
             } else {
                 setStatus("USB権限が許可されませんでした")
             }
         }
+    }
+
+    // A Bluetooth controller that drops out sends no "release" events, so the
+    // last stick deflection would keep being transmitted. Neutralize on removal.
+    private val inputDeviceListener = object : InputManager.InputDeviceListener {
+        override fun onInputDeviceAdded(deviceId: Int) {}
+        override fun onInputDeviceChanged(deviceId: Int) {}
+        override fun onInputDeviceRemoved(deviceId: Int) {
+            releasePhysicalInputs("コントローラー切断：スティック・ボタンをニュートラルに戻しました")
+        }
+    }
+
+    private fun releasePhysicalInputs(status: String?) {
+        synchronized(pad) { pad.clearPhysical() }
+        updateUiState()
+        if (status != null) setStatus(status)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -399,6 +417,7 @@ class MainActivity : Activity() {
 
         controlConfig = loadControlConfig()
         registerUsbReceiver()
+        (getSystemService(INPUT_SERVICE) as InputManager).registerInputDeviceListener(inputDeviceListener, mainHandler)
         buildUi()
         updateConnectionBadges()
         updateUiState()
@@ -414,6 +433,7 @@ class MainActivity : Activity() {
         mainHandler.removeCallbacks(aiTick)
         senderExecutor.shutdownNow()
         diagExecutor.shutdownNow()
+        (getSystemService(INPUT_SERVICE) as InputManager).unregisterInputDeviceListener(inputDeviceListener)
         try {
             unregisterReceiver(usbPermissionReceiver)
         } catch (_: Exception) {
@@ -456,7 +476,13 @@ class MainActivity : Activity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) enableImmersiveLandscape()
+        if (hasFocus) {
+            enableImmersiveLandscape()
+        } else {
+            // Key-up events go to whichever window has focus (dialog, shade);
+            // without this a button held at that moment stays latched.
+            releasePhysicalInputs(null)
+        }
     }
 
     private fun enableImmersiveLandscape() {
@@ -546,6 +572,13 @@ class MainActivity : Activity() {
 
     private fun handleUsbAttached(device: UsbDevice) {
         if (connectedDeviceId == device.deviceId && serialPort != null) return
+        // USBハブ経由のゲームパッド等、シリアルでない機器の接続で
+        // 操縦中のMU-3リンクを閉じてはいけない。
+        if (serialProber().probeDevice(device) == null) return
+        if (serialPort != null) {
+            setStatus("別のUSBシリアル機器を検出（接続中のMU-3を維持します）")
+            return
+        }
         if (usbManager.hasPermission(device)) {
             setStatus("USB attached: opening serial")
             openSerialForDeviceAsync(device)
@@ -567,7 +600,11 @@ class MainActivity : Activity() {
     }
 
     private fun requestUsbPermission(device: UsbDevice) {
-        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        // The USB service fills EXTRA_DEVICE / EXTRA_PERMISSION_GRANTED into this
+        // intent, which an immutable PendingIntent silently drops (always "denied").
+        // The intent is explicit (setPackage), so a mutable one is safe.
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
         val permissionIntent = PendingIntent.getBroadcast(
             this,
             device.deviceId,
@@ -4756,12 +4793,15 @@ class MainActivity : Activity() {
         findViewById<View>(android.R.id.content).performHapticFeedback(constant)
     }
 
-    private fun connectUsbSerial() {
+    private fun serialProber(): UsbSerialProber {
         val customTable = UsbSerialProber.getDefaultProbeTable().apply {
             addProduct(0x0403, 0x6001, FtdiSerialDriver::class.java)
         }
-        val prober = UsbSerialProber(customTable)
-        val drivers = prober.findAllDrivers(usbManager)
+        return UsbSerialProber(customTable)
+    }
+
+    private fun connectUsbSerial() {
+        val drivers = serialProber().findAllDrivers(usbManager)
         if (drivers.isEmpty()) {
             val deviceList = usbManager.deviceList
             if (deviceList.isEmpty()) {
@@ -4813,22 +4853,19 @@ class MainActivity : Activity() {
     }
 
     private fun openSerialForDevice(device: UsbDevice) {
+        // Look up the driver before tearing down the current link, so a failed
+        // lookup does not drop a working connection.
+        val driver = serialProber().probeDevice(device)
+        if (driver == null) {
+            setStatus("対応するUSBシリアルドライバが見つかりません")
+            return
+        }
+
         stopSendingInternal(showStatus = false, joinThread = true)
 
         // Need to ensure we don't have multiple connections
         synchronized(serialWriteLock) {
             closeSerialInternal()
-        }
-
-        val customTable = UsbSerialProber.getDefaultProbeTable().apply {
-            addProduct(0x0403, 0x6001, FtdiSerialDriver::class.java)
-        }
-        val prober = UsbSerialProber(customTable)
-        val drivers = prober.findAllDrivers(usbManager)
-        val driver = drivers.firstOrNull { it.device.deviceId == device.deviceId }
-        if (driver == null) {
-            setStatus("対応するUSBシリアルドライバが見つかりません")
-            return
         }
 
         val connection = usbManager.openDevice(driver.device)
@@ -4916,6 +4953,9 @@ class MainActivity : Activity() {
         val intervalMs = txIntervalMs.coerceIn(10L, 1000L)
         txErrorCount = 0
         lastTxError = ""
+        // aiLastTxMs still holds the previous session's last send; without this
+        // the sentinel reports a "送信停止" stall right after every START.
+        aiSuppressStallUntilMs = SystemClock.elapsedRealtime() + 2200L
         isSending = true
 
         // 送信は固定デッドラインの transmissionLoop に一本化する。
@@ -5030,14 +5070,16 @@ class MainActivity : Activity() {
                 if ((payloadBuffer[6].toInt() and 0xC7) == 0x40) {
                     payloadBuffer[6] = (payloadBuffer[6].toInt() and 0xBF).toByte()
                 }
+                // マクロ学習中なら、操縦者の7バイトを確保ゼロで時系列記録する。
+                // 保存地点/仰角の専用フレームを混ぜる前に記録すること。混ぜた後を記録すると、
+                // 再生時に上の予約マーカー除去で専用フレームが payload[6] の機構bitへ化ける。
+                if (macroRec.learning) {
+                    macroRec.add(SystemClock.elapsedRealtime(), payloadBuffer)
+                }
                 // Always interleave ordinary controls with dedicated commands.
                 // The receiver retains held controls across dedicated frames.
                 radioCommands.fill(payloadBuffer, SystemClock.elapsedRealtime(),
                     anglePresetCommand, savedNavigation)
-                // マクロ学習中なら、実際に送る7バイトを確保ゼロで時系列記録する。
-                if (macroRec.learning) {
-                    macroRec.add(SystemClock.elapsedRealtime(), payloadBuffer)
-                }
 
                 // 2. Format Frame (@DT0E + 14HEX + \r\n) directly into sendBuffer
                 for (i in 0 until 7) {
@@ -5478,6 +5520,11 @@ class MainActivity : Activity() {
                     }
                     if (found != null) break
                 }
+                // 見つからなければ、最後に試した速度・線状態のままにせず元の設定へ戻す。
+                if (found == null) {
+                    port.setParameters(currentBaudRate, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
+                    applyMu3LinePresetLocked(port, mu3LinePreset)
+                }
             }
             val ok = found
             if (ok != null) {
@@ -5581,10 +5628,10 @@ class MainActivity : Activity() {
             setStatus("送信周期は10〜1000msで入力してください")
             return
         }
-        val wasSending = isSending
-        if (wasSending) stopSending()
+        // 送信ループは毎周期 txIntervalMs を読むので、停止せずにそのまま反映する。
+        // 停止→再開すると保存地点・仰角の指示が取り消されてしまう（AUTO-TUNEは1.6秒ごとに呼ぶ）。
         txIntervalMs = stableTxIntervalMs(next)
-        
+
         // Sync SeekBar
         if (::txIntervalSeekBar.isInitialized) {
             txIntervalSeekBar.progress = (txIntervalMs.toInt() - 10).coerceIn(0, 190)
@@ -5595,7 +5642,6 @@ class MainActivity : Activity() {
         setStatus("送信周期を ${txIntervalMs}ms に変更$corrected")
         updateConnectionBadges()
         updateCommUi()
-        if (wasSending) startSending()
     }
 
     private fun setTxInterval(ms: Int) {
@@ -5731,7 +5777,7 @@ class MainActivity : Activity() {
             val errorLine = if (txErrorCount > 0) "\nTX errors: $txErrorCount / last=$lastTxError" else ""
             val diagLine = if (diagBusy.get()) "\nDIAG: running" else "\nDIAG: idle"
             commStatusText.text = "TX FORMAT: @DT0E + HEX ASCII / ${txIntervalMs} ms / ${currentBaudRate} bps\n" +
-                "Scheduler: old stable fixed-delay sender / write timeout 50ms / diagnostics guarded" +
+                "Scheduler: fixed-deadline sender / write timeout ${timeoutForFrame(MU3_TX_FRAME_LEN)}ms / diagnostics guarded" +
                 diagLine + errorLine
         }
     }
@@ -5851,13 +5897,12 @@ class MainActivity : Activity() {
             stopSendingFromWorker()
             var accepted = 0
             var irError = 0
-            val neutral = PadState.neutralPayload()
+            // payload[6] は機構ボタン・非常停止・仰角プリセットに使われるため、
+            // 試験フレームは必ずニュートラルにする（受信側を動かさない）。
+            val frame = formatMu3Frame(PadState.neutralPayload())
             for (i in 1..count) {
-                val payload = neutral.copyOf()
-                payload[6] = (i and 0x7F).toByte()
                 val response = synchronized(serialWriteLock) {
                     val port = serialPort ?: throw IllegalStateException("MU-3が未接続です")
-                    val frame = formatMu3Frame(payload)
                     port.write(frame.toByteArray(StandardCharsets.US_ASCII), 50)
                     String(readSerialAvailableLocked(port, 180), StandardCharsets.ISO_8859_1)
                 }
@@ -5901,10 +5946,10 @@ class MainActivity : Activity() {
 
             val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
             val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
-            pad.setControllerInput(KeyEvent.KEYCODE_DPAD_LEFT, hatX < -0.5f)
-            pad.setControllerInput(KeyEvent.KEYCODE_DPAD_RIGHT, hatX > 0.5f)
-            pad.setControllerInput(KeyEvent.KEYCODE_DPAD_UP, hatY < -0.5f)
-            pad.setControllerInput(KeyEvent.KEYCODE_DPAD_DOWN, hatY > 0.5f)
+            pad.setAxisInput(KeyEvent.KEYCODE_DPAD_LEFT, hatX < -0.5f)
+            pad.setAxisInput(KeyEvent.KEYCODE_DPAD_RIGHT, hatX > 0.5f)
+            pad.setAxisInput(KeyEvent.KEYCODE_DPAD_UP, hatY < -0.5f)
+            pad.setAxisInput(KeyEvent.KEYCODE_DPAD_DOWN, hatY > 0.5f)
 
             val l2 = chooseNonZero(
                 getCenteredAxis(event, MotionEvent.AXIS_LTRIGGER),
@@ -5914,8 +5959,8 @@ class MainActivity : Activity() {
                 getCenteredAxis(event, MotionEvent.AXIS_RTRIGGER),
                 getCenteredAxis(event, MotionEvent.AXIS_GAS)
             ) > 0.5f
-            pad.setControllerInput(KeyEvent.KEYCODE_BUTTON_L2, l2)
-            pad.setControllerInput(KeyEvent.KEYCODE_BUTTON_R2, r2)
+            pad.setAxisInput(KeyEvent.KEYCODE_BUTTON_L2, l2)
+            pad.setAxisInput(KeyEvent.KEYCODE_BUTTON_R2, r2)
         }
         updateUiState()
         return true
@@ -6556,14 +6601,29 @@ class MainActivity : Activity() {
         var ry = 0f
 
         private val controllerStates = mutableMapOf<Int, Boolean>()
+        // D-pad / L2 / R2 can arrive both as key events and as analog axes from
+        // the same controller. Keep the sources apart and OR them, otherwise a
+        // stick movement clears a held key (and vice versa).
+        private val axisStates = mutableMapOf<Int, Boolean>()
         private val directTargets = mutableMapOf<String, PayloadTarget>()
-        fun setDirectTarget(key: String, target: PayloadTarget?) {
-            if (target == null) directTargets.remove(key) else directTargets[key] = target
-        }
         private val screenStates = BooleanArray(maxScreenButtons + 1)
 
         fun setControllerInput(inputId: Int, value: Boolean) {
             controllerStates[inputId] = value
+        }
+
+        fun setAxisInput(inputId: Int, value: Boolean) {
+            axisStates[inputId] = value
+        }
+
+        private fun isPressed(inputId: Int): Boolean =
+            controllerStates[inputId] == true || axisStates[inputId] == true
+
+        /** Physical controller lost (disconnect / focus loss): release sticks and buttons. */
+        fun clearPhysical() {
+            lx = 0f; ly = 0f; rx = 0f; ry = 0f
+            controllerStates.clear()
+            axisStates.clear()
         }
 
         fun setScreenButton(slot: Int, value: Boolean) {
@@ -6579,8 +6639,7 @@ class MainActivity : Activity() {
         }
 
         fun clearAll() {
-            lx = 0f; ly = 0f; rx = 0f; ry = 0f
-            controllerStates.clear()
+            clearPhysical()
             directTargets.clear()
             clearScreenButtons()
         }
@@ -6593,7 +6652,7 @@ class MainActivity : Activity() {
                 ly = ly,
                 rx = rx,
                 ry = ry,
-                controllerStates = controllerStates.toMap(),
+                controllerStates = (controllerStates.keys + axisStates.keys).associateWith { isPressed(it) },
                 screenStates = screenStates.copyOf(),
                 payload = buf
             )
@@ -6610,9 +6669,9 @@ class MainActivity : Activity() {
             out[6] = 0
 
             for (target in directTargets.values) setTargetOptimized(out, target)
-            for ((inputId, pressed) in controllerStates) {
-                if (!pressed) continue
-                val target = targetsById[config.controllerTargets[inputId] ?: "NONE"] ?: continue
+            for ((inputId, targetId) in config.controllerTargets) {
+                if (!isPressed(inputId)) continue
+                val target = targetsById[targetId] ?: continue
                 setTargetOptimized(out, target)
             }
 
