@@ -94,4 +94,18 @@ class NavigationRadioMux {
 object RadioTxTiming {
     fun deadline(scheduled: Long, lastStart: Long, minimumInterval: Long, urgent: Boolean): Long =
         if (urgent) minOf(scheduled, lastStart + minimumInterval) else scheduled
+
+    /**
+     * Earliest gap after the previous frame at which a button edge may be sent
+     * ahead of schedule. Half the period keeps the radio load bounded (edges are
+     * human-rate) while cutting the mean wait for a press from period/2 to period/8.
+     */
+    fun edgeGapMs(intervalMs: Long, floorMs: Long): Long = maxOf(floorMs, intervalMs / 2)
+
+    /** Shortest period at which the UART can carry one frame (8N1), plus a guard. */
+    fun minimumIntervalMs(baud: Int, frameBytes: Int, guardMs: Long): Long {
+        if (baud <= 0) return 10L
+        val wireMs = (frameBytes * 10L * 1000L + baud - 1L) / baud
+        return maxOf(10L, wireMs + guardMs)
+    }
 }

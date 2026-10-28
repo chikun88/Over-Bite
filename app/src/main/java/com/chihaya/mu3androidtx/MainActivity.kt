@@ -143,6 +143,32 @@ class MainActivity : Activity() {
 
     private val pad = PadState(maxScreenButtons)
     private val configLock = Any()
+
+    // ===== 低遅延送信 =====
+    // ボタンの押下/解放は次の定周期を待たず、前回送信から周期の半分経っていれば即送る。
+    // スティックの連続変化では発火しないので、無線の平均送信レートはほぼ増えない。
+    @Volatile private var lowLatencyEdges = true
+    @Volatile private var inputEdgePending = false
+    private var lowLatencyButton: TextView? = null
+    // 入力イベントごとのUI再描画（Drawable生成）がメインスレッドの入力処理を遅らせるため、
+    // 表示更新は1回にまとめる。送信内容(pad)は即時に更新される。
+    private var uiStateUpdatePosted = false
+    private val uiStateUpdate = Runnable {
+        uiStateUpdatePosted = false
+        updateUiState()
+    }
+
+    private fun signalInputEdge() {
+        if (!lowLatencyEdges || !isSending) return
+        inputEdgePending = true
+        senderThread?.let { LockSupport.unpark(it) }
+    }
+
+    private fun requestUiStateUpdate() {
+        if (uiStateUpdatePosted) return
+        uiStateUpdatePosted = true
+        mainHandler.post(uiStateUpdate)
+    }
     private lateinit var controlConfig: ControlConfig
 
     // ===== Telemetry / Black Box =====
@@ -428,6 +454,7 @@ class MainActivity : Activity() {
         mainHandler.removeCallbacks(telemetryRefresh)
         mainHandler.removeCallbacks(replayTick)
         mainHandler.removeCallbacks(aiTick)
+        mainHandler.removeCallbacks(uiStateUpdate)
         diagExecutor.shutdownNow()
         (getSystemService(INPUT_SERVICE) as InputManager).unregisterInputDeviceListener(inputDeviceListener)
         try {
@@ -474,6 +501,11 @@ class MainActivity : Activity() {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
             enableImmersiveLandscape()
+            // ジョイスティックのMOVEは既定で画面のvsync単位にまとめて配送され、最大1フレーム
+            // 遅れる。ウィンドウに接続済みのこの時点で即時配送を要求する。
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                window.decorView.requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK)
+            }
         } else {
             // Key-up events go to whichever window has focus (dialog, shade);
             // without this a button held at that moment stays latched.
@@ -2027,8 +2059,9 @@ class MainActivity : Activity() {
             return
         }
         if (stableTxIntervalMs(20L) > 40L) {
-            setStatus("自己位置リセットには送信周期を40ms以下に設定してください")
-            savedNavigationStatus?.text = "自己位置リセットには送信周期を40ms以下に設定してください"
+            val text = "${currentBaudRate}bpsでは40ms以下で送信できません。通信速度を9600bps以上にしてください"
+            setStatus(text)
+            savedNavigationStatus?.text = text
             return
         }
         stopAutopilotInternal(neutralize = false)
@@ -2056,8 +2089,9 @@ class MainActivity : Activity() {
         }
         if (stableTxIntervalMs(20L) > 40L) {
             map?.clearSelection()
-            savedNavigationStatus?.text = "自動走行には送信周期を40ms以下に設定してください"
-            setStatus("自動走行には送信周期を40ms以下に設定してください")
+            val text = "${currentBaudRate}bpsでは40ms以下で送信できません。通信速度を9600bps以上にしてください"
+            savedNavigationStatus?.text = text
+            setStatus(text)
             return
         }
         stopAutopilotInternal(neutralize = false)
@@ -2194,6 +2228,10 @@ class MainActivity : Activity() {
                             addView(smallButton("100ms", color("#00A8A8")) { setTxInterval(100) })
                         }
                         addView(cyclePresets)
+                        addSpace(8)
+                        lowLatencyButton = smallButton("", color("#00A8A8")) { toggleLowLatencyEdges() }
+                        addView(lowLatencyButton)
+                        updateLowLatencyButton()
                         addSpace(12)
 
                         val periodInputRow = LinearLayout(context).apply {
@@ -3965,12 +4003,14 @@ class MainActivity : Activity() {
                     } else {
                         synchronized(pad) { pad.toggleScreenButton(spec.slot) }
                     }
+                    signalInputEdge()
                     updateUiState()
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     container.animate().scaleX(1f).scaleY(1f).setDuration(160).setInterpolator(OvershootInterpolator(1.6f)).start()
                     if (spec.mode == FeatureMode.MOMENTARY) {
                         synchronized(pad) { pad.setScreenButton(spec.slot, false) }
+                        signalInputEdge()
                         updateUiState()
                     }
                     if (event.action == MotionEvent.ACTION_UP) action.performClick()
@@ -4139,6 +4179,16 @@ class MainActivity : Activity() {
         root.addView(mappingEditorScrollView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
         dialog.setView(root)
+        // ダイアログ表示中のキーはActivityのdispatchKeyEventに届かない。ここで受けて
+        // 該当項目へジャンプする（○/Bが「戻る」扱いでダイアログを閉じるのも防ぐ）。
+        // 送信用のpad状態は変えない：フォーカス外の押下は離した時に解除されないため。
+        dialog.setOnKeyListener { _, keyCode, event ->
+            if (!isGameControllerEvent(event) || !controllerInputByKeyCode.containsKey(keyCode)) {
+                return@setOnKeyListener false
+            }
+            if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) highlightInputRow(keyCode)
+            true
+        }
         dialog.setOnDismissListener {
             mappingDialog = null
             mappingEditorScrollView = null
@@ -4815,6 +4865,9 @@ class MainActivity : Activity() {
         var txCount = 0
         var lastPayloadUiUpdateMs = 0L
         var consecutiveTxErrors = 0
+        // 直前の待機をボタンエッジ/保存地点で前倒ししたか。前倒し分は周期の揺れではないので
+        // ジッタ統計（AUTO-TUNE・センチネルの判断材料）から除く。
+        var earlyFrame = false
         val radioCommands = NavigationRadioMux()
 
         while (isSending && generation == senderGeneration.get() && !Thread.currentThread().isInterrupted) {
@@ -4823,6 +4876,8 @@ class MainActivity : Activity() {
                 val intervalMs = stableTxIntervalMs(requestedIntervalMs)
                 val intervalNs = intervalMs * 1_000_000L
                 val txStartNs = SystemClock.elapsedRealtimeNanos()
+                // ここで入力を読むので、これ以前のエッジはこのフレームに含まれる。
+                inputEdgePending = false
                 val cfg = currentConfig()
 
                 // 1. Prepare payload in a local buffer to keep the TX thread allocation-free.
@@ -4878,14 +4933,14 @@ class MainActivity : Activity() {
                 val gapMsForRecord = if (lastTxStartNs != 0L) {
                     val actualIntervalNs = txStartNs - lastTxStartNs
                     val jitterNs = abs(actualIntervalNs - intervalNs)
-                    if (jitterNs > maxJitterNs) maxJitterNs = jitterNs
+                    if (!earlyFrame && jitterNs > maxJitterNs) maxJitterNs = jitterNs
                     (actualIntervalNs / 1_000_000L).toInt()
                 } else 0
                 lastTxStartNs = txStartNs
                 txCount++
 
                 // 4a-AI. オンデバイスAIのライブ信号へ反映（確保ゼロ・記録ON/OFFに依らず常時）。
-                aiOnTx(ack = rxBytes > 0, gapMs = gapMsForRecord, error = false)
+                aiOnTx(ack = rxBytes > 0, gapMs = if (earlyFrame) 0 else gapMsForRecord, error = false)
 
                 // 4b. Black box: 実際に送った7バイトpayloadと送信間隔・ACK有無を記録する。
                 // 確保ゼロのプリミティブ配列書き込みなので、最優先送信スレッドでも安全。
@@ -4929,7 +4984,7 @@ class MainActivity : Activity() {
                 if (afterWriteNs >= nextTickNs) {
                     nextTickNs = afterWriteNs + intervalNs
                 }
-                waitUntilNs(nextTickNs, generation, txStartNs)
+                earlyFrame = waitUntilNs(nextTickNs, generation, txStartNs, intervalMs)
 
             } catch (e: InterruptedException) {
                 break
@@ -4979,7 +5034,7 @@ class MainActivity : Activity() {
                 val linkFailure = consecutiveTxErrors >= TX_MAX_CONSECUTIVE_ERRORS
                 isSending = false
                 savedNavigation.stop()
-        anglePresetCommand.stop()
+                anglePresetCommand.stop()
                 mainHandler.post {
                     savedNavigationMap?.clearSelection()
                     savedNavigationStatus?.text = "通信停止 / 再操作が必要"
@@ -5005,12 +5060,20 @@ class MainActivity : Activity() {
         mainHandler.post { updateConnectionBadges() }
     }
 
-    private fun waitUntilNs(deadlineNs: Long, generation: Int, lastTxStartNs: Long) {
+    /** 戻り値: 保存地点/ボタンエッジにより予定より前倒しで抜けたか。 */
+    private fun waitUntilNs(deadlineNs: Long, generation: Int, lastTxStartNs: Long, intervalMs: Long): Boolean {
         while (isSending && generation == senderGeneration.get()) {
+            var minimumGapMs = Long.MAX_VALUE
+            if (savedNavigation.transmitting) minimumGapMs = stableTxIntervalMs(20L)
+            if (inputEdgePending) {
+                // stableTxIntervalMs(10L) は現在のボーレートでのUART下限。
+                minimumGapMs = minOf(minimumGapMs, RadioTxTiming.edgeGapMs(intervalMs, stableTxIntervalMs(10L)))
+            }
+            val urgent = minimumGapMs != Long.MAX_VALUE
             val effectiveDeadline = RadioTxTiming.deadline(deadlineNs, lastTxStartNs,
-                stableTxIntervalMs(20L) * 1_000_000L, savedNavigation.transmitting)
+                if (urgent) minimumGapMs * 1_000_000L else 0L, urgent)
             val waitNs = effectiveDeadline - SystemClock.elapsedRealtimeNanos()
-            if (waitNs <= 0L) return
+            if (waitNs <= 0L) return effectiveDeadline < deadlineNs
             // unpark wakes a long manual-period wait on a tap/cancel. Unlike
             // interrupt it does not terminate the serial transmission loop.
             LockSupport.parkNanos(waitNs)
@@ -5020,8 +5083,28 @@ class MainActivity : Activity() {
     }
 
     private fun sendNeutralOnce() {
+        sendBurstFrame(PadState.neutralPayload(), navigationRelease = false)
+    }
+
+    /**
+     * 送信停止（非常停止・STOP・onPause）では送信ループが止まり、保存地点の明示解除
+     * フレームが一度も出ないまま、受信側の通信断タイムアウト頼みになっていた。
+     * 解除待ちがあれば、ニュートラルの合間に解除フレームを送る。
+     */
+    private fun sendNavigationReleaseOnce() {
+        val payload = PadState.neutralPayload()
+        if (!savedNavigation.releasePending || !savedNavigation.fill(payload, SystemClock.elapsedRealtime())) {
+            sendNeutralOnce()
+            return
+        }
+        sendBurstFrame(payload, navigationRelease = true)
+    }
+
+    private fun sendBurstFrame(payload: ByteArray, navigationRelease: Boolean) {
         try {
-            sendPayload(PadState.neutralPayload())
+            if (serialPort == null) return
+            sendPayload(payload)
+            if (navigationRelease) savedNavigation.onTransmitted(payload, SystemClock.elapsedRealtime())
         } catch (e: Exception) {
             lastTxError = e.message ?: e.javaClass.simpleName
             if (serialPort != null || connectedDeviceId != -1) {
@@ -5053,7 +5136,9 @@ class MainActivity : Activity() {
             try {
                 val safeCount = count.coerceAtLeast(1)
                 repeat(safeCount) { index ->
-                    sendNeutralOnce()
+                    // 受信側は専用フレームをボタン解放と見なさないので、通常ニュートラルと
+                    // 交互にし、最後は必ずニュートラルで終える。
+                    if (index % 2 == 1 && index != safeCount - 1) sendNavigationReleaseOnce() else sendNeutralOnce()
                     if (index != safeCount - 1) Thread.sleep(6)
                 }
             } catch (_: Exception) {
@@ -5089,13 +5174,17 @@ class MainActivity : Activity() {
         return "@DT${String.format(Locale.US, "%02X", payloadHex.length)}$payloadHex \\r\\n"
     }
 
+    // UARTが1フレームを送り切れない周期で書き込むと、USBシリアル側のFIFOに溜まって
+    // 遅延が伸び続け、最後はwriteタイムアウトでリンクが落ちる。速度に応じた下限で補正する。
     private fun stableTxIntervalMs(requestedMs: Long = txIntervalMs): Long {
-        return requestedMs.coerceIn(10L, 1000L)
+        val floor = RadioTxTiming.minimumIntervalMs(currentBaudRate, MU3_TX_FRAME_LEN, TX_MIN_GUARD_MS)
+        return requestedMs.coerceIn(floor.coerceAtMost(1000L), 1000L)
     }
 
     private fun enforceStableTxIntervalForBaud(): Boolean {
-        txIntervalMs = stableTxIntervalMs(txIntervalMs)
-        return false
+        val before = txIntervalMs
+        txIntervalMs = stableTxIntervalMs(before)
+        return txIntervalMs != before
     }
 
     private fun senderStopJoinTimeoutMs(): Long {
@@ -5406,6 +5495,18 @@ class MainActivity : Activity() {
         updateCommUi()
     }
 
+    private fun toggleLowLatencyEdges() {
+        lowLatencyEdges = !lowLatencyEdges
+        inputEdgePending = false
+        saveCommSettings()
+        updateLowLatencyButton()
+        setStatus(if (lowLatencyEdges) "即時送信ON：ボタン入力は次の周期を待たずに送信します" else "即時送信OFF：すべて定周期で送信します")
+    }
+
+    private fun updateLowLatencyButton() {
+        lowLatencyButton?.text = if (lowLatencyEdges) "⚡ ボタン即時送信: ON" else "ボタン即時送信: OFF（定周期のみ）"
+    }
+
     private fun setTxInterval(ms: Int) {
         if (::txIntervalInput.isInitialized) txIntervalInput.setText(ms.toString())
         applyTxIntervalFromUi()
@@ -5517,6 +5618,7 @@ class MainActivity : Activity() {
         mu3LinePreset = prefs.getString("line_preset", "SAFE") ?: "SAFE"
         isDarkMode = prefs.getBoolean("dark_mode", false)
         savedNavigationRightField = prefs.getBoolean("saved_nav_right_field", false)
+        lowLatencyEdges = prefs.getBoolean("low_latency_edges", true)
     }
 
     private fun saveCommSettings() {
@@ -5526,6 +5628,7 @@ class MainActivity : Activity() {
             .putString("line_preset", mu3LinePreset)
             .putBoolean("dark_mode", isDarkMode)
             .putBoolean("saved_nav_right_field", savedNavigationRightField)
+            .putBoolean("low_latency_edges", lowLatencyEdges)
             .apply()
     }
 
@@ -5695,6 +5798,7 @@ class MainActivity : Activity() {
             if (r2) highlightInputRow(KeyEvent.KEYCODE_BUTTON_R2)
         }
 
+        var edge = false
         synchronized(pad) {
             pad.lx = getCenteredAxis(event, MotionEvent.AXIS_X)
             pad.ly = getCenteredAxis(event, MotionEvent.AXIS_Y)
@@ -5708,10 +5812,10 @@ class MainActivity : Activity() {
 
             val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
             val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
-            pad.setAxisInput(KeyEvent.KEYCODE_DPAD_LEFT, hatX < -0.5f)
-            pad.setAxisInput(KeyEvent.KEYCODE_DPAD_RIGHT, hatX > 0.5f)
-            pad.setAxisInput(KeyEvent.KEYCODE_DPAD_UP, hatY < -0.5f)
-            pad.setAxisInput(KeyEvent.KEYCODE_DPAD_DOWN, hatY > 0.5f)
+            edge = pad.setAxisInput(KeyEvent.KEYCODE_DPAD_LEFT, hatX < -0.5f) || edge
+            edge = pad.setAxisInput(KeyEvent.KEYCODE_DPAD_RIGHT, hatX > 0.5f) || edge
+            edge = pad.setAxisInput(KeyEvent.KEYCODE_DPAD_UP, hatY < -0.5f) || edge
+            edge = pad.setAxisInput(KeyEvent.KEYCODE_DPAD_DOWN, hatY > 0.5f) || edge
 
             val l2 = chooseNonZero(
                 getCenteredAxis(event, MotionEvent.AXIS_LTRIGGER),
@@ -5721,10 +5825,11 @@ class MainActivity : Activity() {
                 getCenteredAxis(event, MotionEvent.AXIS_RTRIGGER),
                 getCenteredAxis(event, MotionEvent.AXIS_GAS)
             ) > 0.5f
-            pad.setAxisInput(KeyEvent.KEYCODE_BUTTON_L2, l2)
-            pad.setAxisInput(KeyEvent.KEYCODE_BUTTON_R2, r2)
+            edge = pad.setAxisInput(KeyEvent.KEYCODE_BUTTON_L2, l2) || edge
+            edge = pad.setAxisInput(KeyEvent.KEYCODE_BUTTON_R2, r2) || edge
         }
-        updateUiState()
+        if (edge) signalInputEdge()
+        requestUiStateUpdate()
         return true
     }
 
@@ -5737,10 +5842,11 @@ class MainActivity : Activity() {
         }
 
         val pressed = event.action != KeyEvent.ACTION_UP
-        synchronized(pad) {
+        val edge = synchronized(pad) {
             pad.setControllerInput(input.id, pressed)
         }
-        updateUiState()
+        if (edge) signalInputEdge()
+        requestUiStateUpdate()
         return true
     }
 
@@ -6370,12 +6476,17 @@ class MainActivity : Activity() {
         private val directTargets = mutableMapOf<String, PayloadTarget>()
         private val screenStates = BooleanArray(maxScreenButtons + 1)
 
-        fun setControllerInput(inputId: Int, value: Boolean) {
+        /** 戻り値: 送信内容が変わる押下状態の変化（エッジ）があったか。 */
+        fun setControllerInput(inputId: Int, value: Boolean): Boolean {
+            val before = isPressed(inputId)
             controllerStates[inputId] = value
+            return before != isPressed(inputId)
         }
 
-        fun setAxisInput(inputId: Int, value: Boolean) {
+        fun setAxisInput(inputId: Int, value: Boolean): Boolean {
+            val before = isPressed(inputId)
             axisStates[inputId] = value
+            return before != isPressed(inputId)
         }
 
         private fun isPressed(inputId: Int): Boolean =

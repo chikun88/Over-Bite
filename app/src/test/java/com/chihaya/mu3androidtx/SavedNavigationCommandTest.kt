@@ -279,6 +279,25 @@ class SavedNavigationCommandTest {
     }
 
     @Test
+    fun uartFloorKeepsFramesWithinTheWireTimeAndAllowsNavigationFrom9600() {
+        // @DT0E + 14 HEX + CRLF = 21 bytes, 10 bits each on the wire.
+        assertEquals(10L, RadioTxTiming.minimumIntervalMs(57600, 21, 6L))
+        assertEquals(17L, RadioTxTiming.minimumIntervalMs(19200, 21, 6L))
+        assertEquals(28L, RadioTxTiming.minimumIntervalMs(9600, 21, 6L))
+        assertTrue(RadioTxTiming.minimumIntervalMs(4800, 21, 6L) > 40L)
+        assertEquals(181L, RadioTxTiming.minimumIntervalMs(1200, 21, 6L))
+    }
+
+    @Test
+    fun buttonEdgesGoOutEarlyButNeverFasterThanHalfThePeriodOrTheUart() {
+        assertEquals(25L, RadioTxTiming.edgeGapMs(50L, 17L))
+        assertEquals(17L, RadioTxTiming.edgeGapMs(20L, 17L))
+        assertEquals(28L, RadioTxTiming.edgeGapMs(30L, 28L))
+        // An edge 30ms after a frame on a 50ms period is sent at once.
+        assertEquals(25L, RadioTxTiming.deadline(50L, 0L, RadioTxTiming.edgeGapMs(50L, 17L), true))
+    }
+
+    @Test
     fun failedWritesCannotConsumeTheReleaseHandshake() {
         val command = SavedNavigationCommand()
         val out = ByteArray(7)

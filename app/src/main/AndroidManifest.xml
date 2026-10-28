@@ -12,11 +12,13 @@
         android:icon="@drawable/ic_launcher"
         android:theme="@style/AppTheme">
 
+        <!-- コントローラー接続(keyboard/navigation)やダークモード切替(uiMode)で
+             Activityが再生成されると、onDestroyでMU-3リンクが閉じて送信が止まる。 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:screenOrientation="landscape"
-            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize"
+            android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|touchscreen|uiMode|screenLayout|smallestScreenSize"
             tools:ignore="DiscouragedApi">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
