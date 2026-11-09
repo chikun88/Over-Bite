@@ -1,0 +1,10 @@
+<resources>
+    <!-- Android 12+ はアプリ起動時に必ずシステムスプラッシュが出る。
+         背景を黒・アイコンを透明にして、起動動画の黒フェードインと見分けがつかないようにする。 -->
+    <style name="SplashTheme" parent="AppTheme">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:navigationBarColor">#FF000000</item>
+        <item name="android:windowSplashScreenBackground">@android:color/black</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_icon_blank</item>
+    </style>
+</resources>

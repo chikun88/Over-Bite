@@ -11,4 +11,8 @@
         <item name="android:navigationBarColor">#FBFCFF</item>
         <item name="android:statusBarColor">#00000000</item>
     </style>
+    <style name="SplashTheme" parent="AppTheme">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:navigationBarColor">#FF000000</item>
+    </style>
 </resources>
