@@ -147,10 +147,10 @@ class SavedNavigationCommandTest {
         // Must stay identical to saved_pose_names in the automation side's
         // config/mu3_navigation.yaml; the radio only carries the index.
         assertEquals(
-            listOf("A", "BAKETU2", "BAKETU3", "旗上側", "旗下側", "退避位置", "装填位置", "机保護1", "机保護2", "バケツ後2", "バケツ後3", "IDOU"),
+            listOf("A", "BAKETU2", "BAKETU3", "旗上側", "旗下側", "退避位置", "装填位置", "机保護1", "机保護2", "バケツ後2", "バケツ後3", "IDOU", "start mae"),
             SAVED_NAVIGATION_POINTS.map { it.jetsonName },
         )
-        assertEquals((1..7).toList() + (17..20).toList() + 23, SAVED_NAVIGATION_POINTS.map { it.slot })
+        assertEquals((1..7).toList() + (17..20).toList() + 23 + 21, SAVED_NAVIGATION_POINTS.map { it.slot })
     }
 
     @Test
