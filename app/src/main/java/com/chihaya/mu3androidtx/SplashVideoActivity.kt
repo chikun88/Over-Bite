@@ -12,6 +12,7 @@ import android.graphics.SurfaceTexture
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.MediaPlayer
+import android.media.audiofx.LoudnessEnhancer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -28,8 +29,11 @@ import android.widget.ImageView
 
 /**
  * 起動演出:
- *  1. res/raw/splash_video.mp4 を音声付き・画面いっぱい（中央クロップ）で再生する。**スキップ不可**。
- *  2. 再生が終わったら「OVER BITE」の文字ロゴ（[OverbiteLogoView]）を一瞬表示する。**タップでスキップ可**。
+ *  1. res/raw/splash_video.mp4 を画面いっぱい（中央クロップ）で再生する。**スキップ不可**。
+ *     音は必ず爆音で鳴らす: 再生中だけメディア音量を最大にし（マナー/サイレント中も）、
+ *     LoudnessEnhancer でさらに +15dB 持ち上げる。画面を離れたら元の音量に戻す。
+ *  2. 再生が終わったら、アイコンに合わせたドット絵の「OVER BITE」ロゴ（[OverbiteLogoView]）を
+ *     ピクセルディゾルブで重ねて一瞬表示する。**タップでスキップ可**。
  *  3. MainActivity へフェードで遷移する。
  *
  * 起動の段差をなくすため、黒（Android 12+ のシステムスプラッシュも黒・アイコンなし）から
@@ -60,6 +64,9 @@ class SplashVideoActivity : Activity(), TextureView.SurfaceTextureListener {
     /** showLogo が二重に走らないためのフラグ（動画のエラーと完了が両方来る端末がある）。 */
     private var logoShown = false
     private val goToMainRunnable = Runnable { goToMain() }
+    private var loudness: LoudnessEnhancer? = null
+    /** 再生前のメディア音量。再生中だけ最大にし、画面を離れたら元に戻す。 */
+    private var savedMusicVolume = -1
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -132,8 +139,9 @@ class SplashVideoActivity : Activity(), TextureView.SurfaceTextureListener {
         if (finishedToMain) return
         if (logoPhase) {
             logoAnimator?.resume()
-        } else if (prepared) {
-            player?.start()
+        } else {
+            raiseMusicVolumeToMax()
+            if (prepared) player?.start()
         }
     }
 
@@ -141,6 +149,7 @@ class SplashVideoActivity : Activity(), TextureView.SurfaceTextureListener {
         resumed = false
         player?.let { if (it.isPlaying) it.pause() }
         logoAnimator?.pause()
+        restoreMusicVolume()
         super.onPause()
     }
 
@@ -215,16 +224,18 @@ class SplashVideoActivity : Activity(), TextureView.SurfaceTextureListener {
             )
             mp.setDataSource(this, Uri.parse("android.resource://$packageName/${R.raw.splash_video}"))
             mp.setSurface(s)
-            // 端末のメディア音量はそのまま尊重する。マナー/サイレント中は無音で映像だけ流す。
-            val volume = if (isRingerSilenced()) 0f else 1f
-            mp.setVolume(volume, volume)
+            mp.setVolume(1f, 1f)
             mp.isLooping = false
             mp.setOnVideoSizeChangedListener { _, _, _ -> applyCenterCrop() }
+            attachLoudnessBoost(mp)
             mp.setOnPreparedListener {
                 prepared = true
                 applyCenterCrop()
                 if (resumePositionMs > 0) it.seekTo(resumePositionMs)
-                if (resumed) it.start()
+                if (resumed) {
+                    raiseMusicVolumeToMax()
+                    it.start()
+                }
             }
             mp.setOnCompletionListener { showLogo(animateIn = true) }
             mp.setOnErrorListener { _, _, _ ->
@@ -261,8 +272,10 @@ class SplashVideoActivity : Activity(), TextureView.SurfaceTextureListener {
     // --- ロゴ ---
 
     /**
-     * 文字ロゴを表示してアニメーションを流し、終わったら MainActivity へ進む。
-     * [animateIn] が true のときは動画の最後のフレームの上にロゴをクロスフェードで重ねる。
+     * ドット絵ロゴを表示してアニメーションを流し、終わったら MainActivity へ進む。
+     * ロゴの背景はピクセル単位で順に埋まる（OverbiteLogoView 側）ので、[animateIn] が true のときは
+     * 動画の最後のフレームがブロック状に崩れてロゴへ切り替わる。false（画面回転などからの復帰）は
+     * 背景が最初から埋まった状態で始める。
      */
     private fun showLogo(animateIn: Boolean) {
         if (finishedToMain || logoShown) return
@@ -271,21 +284,12 @@ class SplashVideoActivity : Activity(), TextureView.SurfaceTextureListener {
         hidePoster()
         root.animate().cancel()
         root.alpha = 1f
-        logoView.visibility = View.VISIBLE
+        restoreMusicVolume()
+        logoView.skipDissolve = !animateIn
         logoView.progress = 0f
-
-        val run = {
-            // ロゴが不透明になってから動画を解放する（それまでは最後のフレームが下に見えている）。
-            releasePlayer()
-            startLogoAnimation()
-        }
-        if (animateIn) {
-            logoView.alpha = 0f
-            logoView.animate().alpha(1f).setDuration(LOGO_CROSSFADE_MS).withEndAction(run).start()
-        } else {
-            logoView.alpha = 1f
-            run()
-        }
+        logoView.visibility = View.VISIBLE
+        // 動画（最後のフレームで止まっている）はディゾルブの下に見せたいので、解放は遷移時に行う。
+        startLogoAnimation()
     }
 
     private fun startLogoAnimation() {
@@ -296,7 +300,7 @@ class SplashVideoActivity : Activity(), TextureView.SurfaceTextureListener {
             addUpdateListener {
                 val p = it.animatedValue as Float
                 logoView.progress = p
-                // 字間が詰まりきった瞬間に軽く振動させる。
+                // ロゴが揃ってグリッチが走る瞬間に振動させる。
                 if (!hapticDone && p >= HAPTIC_AT) {
                     hapticDone = true
                     logoView.performHapticFeedback(
@@ -324,6 +328,7 @@ class SplashVideoActivity : Activity(), TextureView.SurfaceTextureListener {
         logoAnimator?.removeAllListeners()
         logoAnimator?.cancel()
         releasePlayer()
+        restoreMusicVolume()
         startActivity(Intent(this, MainActivity::class.java))
         // ここで finish() するとタスクの根が消えるため、Android 12+ では MainActivity に灰色の
         // システムスプラッシュが挟まる。ロゴを出したまま MainActivity を重ね、onStop で閉じる。
@@ -333,9 +338,37 @@ class SplashVideoActivity : Activity(), TextureView.SurfaceTextureListener {
 
     // --- 補助 ---
 
-    private fun isRingerSilenced(): Boolean {
-        val am = getSystemService(AUDIO_SERVICE) as? AudioManager ?: return false
-        return am.ringerMode != AudioManager.RINGER_MODE_NORMAL
+    /** 端末のメディア音量を最大にする（元の値は restoreMusicVolume で戻す）。 */
+    private fun raiseMusicVolumeToMax() {
+        val am = getSystemService(AUDIO_SERVICE) as? AudioManager ?: return
+        try {
+            if (savedMusicVolume < 0) savedMusicVolume = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+            am.setStreamVolume(AudioManager.STREAM_MUSIC, am.getStreamMaxVolume(AudioManager.STREAM_MUSIC), 0)
+        } catch (_: Exception) {
+            // おやすみモードの設定などで変更できない端末もあるので無視する。
+        }
+    }
+
+    private fun restoreMusicVolume() {
+        if (savedMusicVolume < 0) return
+        val am = getSystemService(AUDIO_SERVICE) as? AudioManager
+        try {
+            am?.setStreamVolume(AudioManager.STREAM_MUSIC, savedMusicVolume, 0)
+        } catch (_: Exception) {
+        }
+        savedMusicVolume = -1
+    }
+
+    /** 最大音量のさらに上まで音を持ち上げる（+15dB）。非対応端末では何もしない。 */
+    private fun attachLoudnessBoost(mp: MediaPlayer) {
+        try {
+            loudness = LoudnessEnhancer(mp.audioSessionId).apply {
+                setTargetGain(LOUDNESS_GAIN_MB)
+                enabled = true
+            }
+        } catch (_: Exception) {
+            loudness = null
+        }
     }
 
     /** MainActivity のヘッダーと同じ「v1.1 (2)」形式のバージョン表記。 */
@@ -360,6 +393,8 @@ class SplashVideoActivity : Activity(), TextureView.SurfaceTextureListener {
     }
 
     private fun releasePlayerOnly() {
+        loudness?.let { try { it.release() } catch (_: Exception) {} }
+        loudness = null
         player?.let {
             it.setOnCompletionListener(null)
             it.setOnErrorListener(null)
@@ -397,12 +432,13 @@ class SplashVideoActivity : Activity(), TextureView.SurfaceTextureListener {
         const val KEY_POSITION = "splash_position_ms"
         const val KEY_LOGO_PHASE = "splash_logo_phase"
         const val FADE_IN_MS = 220L
-        const val LOGO_CROSSFADE_MS = 200L
-        /** ロゴのアニメーション本体の長さ。 */
-        const val LOGO_ANIM_MS = 1100L
+        /** ロゴのアニメーション本体の長さ（ディゾルブ込み）。 */
+        const val LOGO_ANIM_MS = 1700L
         /** アニメーション後に静止して見せる時間。 */
-        const val LOGO_HOLD_MS = 450L
-        /** OverbiteLogoView で字間が詰まりきる位置（progress）。 */
-        const val HAPTIC_AT = 0.45f
+        const val LOGO_HOLD_MS = 400L
+        /** OverbiteLogoView でロゴが揃ってグリッチが走る位置（progress）。 */
+        const val HAPTIC_AT = OverbiteLogoView.IMPACT_AT
+        /** LoudnessEnhancer の増幅量（ミリベル）。1500 = +15dB。 */
+        const val LOUDNESS_GAIN_MB = 1500
     }
 }
