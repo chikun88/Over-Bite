@@ -133,6 +133,7 @@ class MainActivity : Activity() {
     private val neutralBurstBusy = AtomicBoolean(false)
     // MU-3内に@DTを溜めないよう、*DT応答を待ってから次を書く（送信ループと停止時の連送で共有）。
     private val radioPacer = Mu3AckPacer()
+    private val lowBatteryAlarm by lazy { LowBatteryAlarm(this) }
     // 直前の待機が無線の応答待ちで周期を超えたか（送信スレッド専用）。ジッタ統計から除く。
     private var lastWaitRadioLimited = false
     private var senderThread: Thread? = null
@@ -452,9 +453,12 @@ class MainActivity : Activity() {
         updateConnectionBadges()
         updateUiState()
         handleInitialUsbIntent(intent)
+        // 電池残量が30%を切ったら音だけ鳴らす（画面・操作には触れない）。
+        lowBatteryAlarm.start()
     }
 
     override fun onDestroy() {
+        lowBatteryAlarm.stop()
         stopSending()
         stopAutopilotInternal(neutralize = false)
         closeSerial()
