@@ -15,31 +15,26 @@ import android.os.Handler
 import android.os.Looper
 
 /**
- * 電池残量が [threshold]% を切った瞬間を判定する（Android に依存しない純粋なロジック）。
+ * 電池残量が [threshold]% 以下かどうかから、警告音を鳴らすタイミングを決める（Android に依存しない純粋なロジック）。
  *
- * - 直前の値が [threshold] 以上で、今回 [threshold] 未満になり、充電中でないときに 1 回だけ true を返す。
- * - 一度鳴ったら、充電されるか [threshold] 以上に戻るまで再び鳴らない。
- * - アプリ起動時点ですでに [threshold] 未満なら鳴らさない（「切った」瞬間ではないため。毎回の起動で鳴るのも防ぐ）。
+ * - 監視を始めて最初に届いた値が [threshold] 以下なら、充電中でも必ず鳴らす（アプリ起動時など）。
+ * - その後は、[threshold] より上から [threshold] 以下に下がった瞬間に鳴らす。
+ * - 一度鳴ったら、[threshold] より上に戻るまで再び鳴らない（1% 減るたびに鳴り続けないため）。
  */
 class LowBatteryTrigger(private val threshold: Int = 30) {
     private var lastPercent: Int? = null
-    private var armed = true
 
-    fun update(percent: Int, charging: Boolean): Boolean {
+    fun update(percent: Int): Boolean {
         val previous = lastPercent
         lastPercent = percent
-        if (charging || percent >= threshold) {
-            armed = true
-            return false
-        }
-        if (!armed) return false
-        armed = false
-        return previous != null && previous >= threshold
+        if (percent > threshold) return false
+        return previous == null || previous > threshold
     }
 }
 
 /**
- * 電池残量が 30% を切ったら res/raw/low_battery_alarm.m4a（約 5 秒）を爆音で鳴らす。
+ * 電池残量が 30% 以下なら res/raw/low_battery_alarm.m4a（約 5 秒）を爆音で鳴らす。
+ * MainActivity の起動時（監視開始時）にすでに 30% 以下なら必ず鳴らし、使用中は 30% 以下に下がった瞬間に鳴らす。
  *
  * 音だけを流し、画面・操作には一切触れない（View もダイアログも出さず、オーディオフォーカスも取らない）。
  * 再生中だけメディア音量を最大にし LoudnessEnhancer で +15dB 持ち上げ、終わったら元の音量に戻す。
@@ -61,10 +56,7 @@ class LowBatteryAlarm(context: Context) {
             val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
             if (level < 0 || scale <= 0) return
             val percent = level * 100 / scale
-            val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
-            val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
-                status == BatteryManager.BATTERY_STATUS_FULL
-            if (trigger.update(percent, charging)) play()
+            if (trigger.update(percent)) play()
         }
     }
 

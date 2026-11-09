@@ -1,6 +1,5 @@
 package com.chihaya.mu3androidtx
 
-import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -8,46 +7,39 @@ import org.junit.jupiter.api.Test
 class LowBatteryTriggerTest {
 
     @Test
-    fun firesOnceWhenDroppingBelowThreshold() {
-        val t = LowBatteryTrigger(30)
-        assertFalse(t.update(31, charging = false))
-        assertFalse(t.update(30, charging = false))
-        assertTrue(t.update(29, charging = false))
-        assertFalse(t.update(29, charging = false))
-        assertFalse(t.update(25, charging = false))
+    fun firesAtStartWhenAlreadyAtOrBelowThreshold() {
+        assertTrue(LowBatteryTrigger(30).update(20))
+        assertTrue(LowBatteryTrigger(30).update(30))
     }
 
     @Test
-    fun doesNotFireWhenAlreadyLowAtStart() {
+    fun doesNotFireAtStartWhenAboveThreshold() {
+        assertFalse(LowBatteryTrigger(30).update(31))
+    }
+
+    @Test
+    fun firesOnceWhenDroppingToThreshold() {
         val t = LowBatteryTrigger(30)
-        assertFalse(t.update(20, charging = false))
-        assertFalse(t.update(19, charging = false))
+        assertFalse(t.update(32))
+        assertFalse(t.update(31))
+        assertTrue(t.update(30))
+        assertFalse(t.update(29))
+        assertFalse(t.update(25))
+    }
+
+    @Test
+    fun doesNotRepeatAfterStartupAlert() {
+        val t = LowBatteryTrigger(30)
+        assertTrue(t.update(25))
+        assertFalse(t.update(25))
+        assertFalse(t.update(24))
     }
 
     @Test
     fun rearmsAfterRecoveringAboveThreshold() {
         val t = LowBatteryTrigger(30)
-        t.update(30, charging = false)
-        assertTrue(t.update(29, charging = false))
-        assertFalse(t.update(31, charging = true))
-        assertFalse(t.update(30, charging = false))
-        assertTrue(t.update(29, charging = false))
-    }
-
-    @Test
-    fun doesNotFireWhileCharging() {
-        val t = LowBatteryTrigger(30)
-        t.update(30, charging = true)
-        assertFalse(t.update(29, charging = true))
-    }
-
-    @Test
-    fun firesAfterUnpluggingOnlyWhenLevelCrosses() {
-        val t = LowBatteryTrigger(30)
-        t.update(28, charging = true)
-        // 抜いた時点ですでに 30% 未満（「切った」瞬間ではない）→ 鳴らさない。
-        assertFalse(t.update(28, charging = false))
-        val fires = listOf(t.update(27, charging = false), t.update(26, charging = false))
-        assertEquals(listOf(false, false), fires)
+        assertTrue(t.update(28))
+        assertFalse(t.update(31))
+        assertTrue(t.update(30))
     }
 }
