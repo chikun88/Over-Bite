@@ -108,9 +108,11 @@ class MainActivity : Activity() {
     private val savedNavigation = SavedNavigationCommand()
     private val anglePresetCommand = AnglePresetCommand()
     private var savedNavigationStatus: TextView? = null
+    private var bucketFollowButton: TextView? = null
     private var savedNavigationTabIndex = 0
     private var savedNavigationMap: SavedNavigationMapView? = null
     private var savedNavigationSideLabel: TextView? = null
+    private var savedNavigationFieldPanel: View? = null
     // The field is remembered across launches: it is set once before a match
     // and getting it wrong sends the robot into the other team's half.
     private var savedNavigationRightField = false
@@ -129,6 +131,11 @@ class MainActivity : Activity() {
     private val serialOpenBusy = AtomicBoolean(false)
     private val diagBusy = AtomicBoolean(false)
     private val neutralBurstBusy = AtomicBoolean(false)
+    // MU-3内に@DTを溜めないよう、*DT応答を待ってから次を書く（送信ループと停止時の連送で共有）。
+    private val radioPacer = Mu3AckPacer()
+    private val lowBatteryAlarm by lazy { LowBatteryAlarm(this) }
+    // 直前の待機が無線の応答待ちで周期を超えたか（送信スレッド専用）。ジッタ統計から除く。
+    private var lastWaitRadioLimited = false
     private var senderThread: Thread? = null
     private val senderGeneration = AtomicInteger(0)
     
@@ -446,9 +453,12 @@ class MainActivity : Activity() {
         updateConnectionBadges()
         updateUiState()
         handleInitialUsbIntent(intent)
+        // 電池残量が30%を切ったら音だけ鳴らす（画面・操作には触れない）。
+        lowBatteryAlarm.start()
     }
 
     override fun onDestroy() {
+        lowBatteryAlarm.stop()
         stopSending()
         stopAutopilotInternal(neutralize = false)
         closeSerial()
@@ -1959,10 +1969,10 @@ class MainActivity : Activity() {
             addView(LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(dp(8), dp(8), dp(8), dp(8))
-                background = tonalSurfaceDrawable(colors.surface, colors.accentInfo, 16f, 0.6f)
+                savedNavigationFieldPanel = this
                 addView(LinearLayout(context).apply {
                     orientation = LinearLayout.HORIZONTAL
-                    savedNavigationSideLabel = smallButton("", colors.accentInfo) {
+                    savedNavigationSideLabel = smallButton("", fieldColor()) {
                         setSavedNavigationField(!savedNavigationRightField)
                     } as TextView
                     savedNavigationSideLabel?.textSize = 12f
@@ -1994,9 +2004,9 @@ class MainActivity : Activity() {
         }.also { updateSavedNavigationSideLabel() }
     }
 
-    /** Five fixed receiver presets; the order is the transmitted preset number. */
+    /** Keep the original receiver IDs for the three remaining elevation presets. */
     private fun createNavigationAnglePanel(): View {
-        val labels = listOf("手前バケツ・スーパー", "奥バケツ", "クリリン移動", "スーパー装填", "ギュッ")
+        val labels = listOf("手前バケツ・スーパー", "奥バケツ", "クリリン移動")
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(10), dp(10), dp(10), dp(10))
@@ -2046,6 +2056,28 @@ class MainActivity : Activity() {
                     setMargins(0, 0, 0, dp(6))
                 })
             }
+            bucketFollowButton = smallButton("", colors.accentSuccess) {
+                if (!isSending) {
+                    setStatus("MU-3を接続してSTARTで送信を開始してください")
+                } else if (savedNavigation.slot == 8) {
+                    stopSavedNavigation()
+                } else {
+                    stopAutopilotInternal(neutralize = false)
+                    macroRec.stop()
+                    anglePresetCommand.stop()
+                    if (stableTxIntervalMs(20L) > 40L) {
+                        setStatus("通信速度を9600bps以上にしてください")
+                        return@smallButton
+                    }
+                    savedNavigationMap?.clearSelection()
+                    savedNavigation.request(8, SystemClock.elapsedRealtime())
+                    senderThread?.let { LockSupport.unpark(it) }
+                    savedNavigationStatus?.text = "バケツ追従要求ON / 手動入力した軸を優先（実機状態はegg8で確認）"
+                    updateBucketFollowButton()
+                }
+            } as TextView
+            addView(bucketFollowButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+            updateBucketFollowButton()
             addView(descriptionText("長押しで設定案内").apply {
                 (this as TextView).textSize = 10f
                 gravity = Gravity.CENTER
@@ -2068,10 +2100,26 @@ class MainActivity : Activity() {
         setStatus("フィールドを${fieldSideName()}に切り替えました")
     }
 
-    private fun fieldSideName() = if (savedNavigationRightField) "右フィールド" else "左フィールド"
+    private fun fieldSideName() = if (savedNavigationRightField) "青フィールド" else "赤フィールド"
+
+    /** Red field = left, blue field = right (rightField flag is unchanged for compatibility). */
+    private fun fieldColor() = if (savedNavigationRightField) colors.accentInfo else colors.accentDanger
 
     private fun updateSavedNavigationSideLabel() {
-        savedNavigationSideLabel?.text = "${fieldSideName()} ↔"
+        val accent = fieldColor()
+        savedNavigationSideLabel?.apply {
+            text = "${fieldSideName()} ↔"
+            background = rippleDrawable(
+                rounded(blendColors(colors.surface, accent, 0.35f), 999f,
+                    strokeColor = accent, strokeWidth = 2),
+                accent, 999f
+            )
+        }
+        savedNavigationFieldPanel?.background = rounded(
+            blendColors(colors.surface, accent, 0.14f), 16f,
+            strokeColor = blendColors(colors.surface, accent, 0.6f), strokeWidth = 2
+        )
+        savedNavigationMap?.setBackgroundColor(blendColors(colors.surfaceVariant, accent, 0.22f))
     }
 
     private fun requestStartPoseReset() {
@@ -2083,6 +2131,7 @@ class MainActivity : Activity() {
         if (stableTxIntervalMs(20L) > 40L) {
             val text = "${currentBaudRate}bpsでは40ms以下で送信できません。通信速度を9600bps以上にしてください"
             setStatus(text)
+            updateBucketFollowButton()
             savedNavigationStatus?.text = text
             return
         }
@@ -2097,6 +2146,7 @@ class MainActivity : Activity() {
         )
         senderThread?.let { LockSupport.unpark(it) }
         val text = "自己位置リセット送信: ${fieldSideName()}の保存済みスタート位置（結果は自動制御側で確認）"
+        updateBucketFollowButton()
         savedNavigationStatus?.text = text
         setStatus(text)
     }
@@ -2112,6 +2162,7 @@ class MainActivity : Activity() {
         if (stableTxIntervalMs(20L) > 40L) {
             map?.clearSelection()
             val text = "${currentBaudRate}bpsでは40ms以下で送信できません。通信速度を9600bps以上にしてください"
+            updateBucketFollowButton()
             savedNavigationStatus?.text = text
             setStatus(text)
             return
@@ -2123,13 +2174,21 @@ class MainActivity : Activity() {
             map?.slotFor(point) ?: point.slot, SystemClock.elapsedRealtime()
         )
         senderThread?.let { LockSupport.unpark(it) }
-        val text = "指示送信中: ${point.label} / ${fieldSideName()}（到達結果は自動制御側で確認）"
+        val text = "指示送信中: ${point.label.replace("\n", "")} /${fieldSideName()}（到達結果は自動制御側で確認）"
+        updateBucketFollowButton()
         savedNavigationStatus?.text = text
         setStatus(text)
     }
 
+    private fun updateBucketFollowButton() {
+        val enabled = savedNavigation.slot == 8
+        bucketFollowButton?.text = if (enabled) "バケツ自動追従 ON\nタップで停止" else "バケツ自動追従 OFF\nタップで開始"
+        bucketFollowButton?.isSelected = enabled
+    }
+
     private fun stopSavedNavigation() {
         savedNavigation.stop()
+        runOnUiThread { updateBucketFollowButton() }
         senderThread?.let { LockSupport.unpark(it) }
         anglePresetCommand.stop()
         savedNavigationMap?.clearSelection()
@@ -4745,6 +4804,12 @@ class MainActivity : Activity() {
             // 以前の版では RTS=false / DTR=true を固定していたが、基板やUSBシリアルICによっては
             // RESET/MODE を意図せず動かして "NO response" になるため、まずは安全側の初期化にする。
             applyMu3LinePresetLocked(port, mu3LinePreset)
+            // FTDIは既定で受信を最大16ms溜めてから渡す。*DT応答の到着がそのぶん遅れ、
+            // 応答待ちの送信間隔が伸びるので1msにする。
+            if (port is FtdiSerialDriver.FtdiSerialPort) {
+                try { port.setLatencyTimer(1) } catch (_: Exception) {}
+            }
+            radioPacer.reset()
 
             // 電源投入直後はMU-3内部が安定するまでコマンドを送らない。
             Thread.sleep(250)
@@ -4782,6 +4847,7 @@ class MainActivity : Activity() {
         usbConnection = null
         connectedDeviceId = -1
         pendingOpenDeviceId = -1
+        radioPacer.reset()
         try {
             port?.close()
         } catch (_: Exception) {
@@ -4840,6 +4906,7 @@ class MainActivity : Activity() {
 
     private fun stopSendingInternal(showStatus: Boolean, joinThread: Boolean) {
         savedNavigation.stop()
+        runOnUiThread { updateBucketFollowButton() }
         anglePresetCommand.stop()
         mainHandler.post {
             savedNavigationMap?.clearSelection()
@@ -4897,6 +4964,8 @@ class MainActivity : Activity() {
         // 直前の待機をボタンエッジ/保存地点で前倒ししたか。前倒し分は周期の揺れではないので
         // ジッタ統計（AUTO-TUNE・センチネルの判断材料）から除く。
         var earlyFrame = false
+        var lastResponseTotal = radioPacer.acks
+        lastWaitRadioLimited = false
         val radioCommands = NavigationRadioMux()
 
         while (isSending && generation == senderGeneration.get() && !Thread.currentThread().isInterrupted) {
@@ -4949,6 +5018,7 @@ class MainActivity : Activity() {
                 val rxBytes = synchronized(serialWriteLock) {
                     val port = serialPort ?: throw IllegalStateException("MU-3 disconnected")
                     port.write(sendBuffer, timeoutForFrame(MU3_TX_FRAME_LEN))
+                    radioPacer.onSent(SystemClock.elapsedRealtimeNanos())
                     savedNavigation.onTransmitted(payloadBuffer, SystemClock.elapsedRealtime())
                     // MU-3 sends *DT response. Drain it to prevent RX buffer overflow.
                     // Allocation-free drain to keep the TX thread free of GC pauses.
@@ -4958,18 +5028,26 @@ class MainActivity : Activity() {
                 // Successful cycle clears the transient-error streak.
                 consecutiveTxErrors = 0
 
+                // ACK: 応答待ちを行う間は、*DTは待ちの中で読まれるので
+                // 書き込み直後の受信バイトでは判定できない。前のフレーム以降に*DTが来たかで見る。
+                val responseTotal = radioPacer.acks
+                val acked = if (radioPacer.pacingActive) responseTotal > lastResponseTotal else rxBytes > 0
+                lastResponseTotal = responseTotal
+
                 // 4. Jitter check by actual TX start timing
+                // 無線の送信完了待ちで周期より遅れたぶんは、端末側の揺れではないので除く。
+                val excludeGap = earlyFrame || lastWaitRadioLimited
                 val gapMsForRecord = if (lastTxStartNs != 0L) {
                     val actualIntervalNs = txStartNs - lastTxStartNs
                     val jitterNs = abs(actualIntervalNs - intervalNs)
-                    if (!earlyFrame && jitterNs > maxJitterNs) maxJitterNs = jitterNs
+                    if (!excludeGap && jitterNs > maxJitterNs) maxJitterNs = jitterNs
                     (actualIntervalNs / 1_000_000L).toInt()
                 } else 0
                 lastTxStartNs = txStartNs
                 txCount++
 
                 // 4a-AI. オンデバイスAIのライブ信号へ反映（確保ゼロ・記録ON/OFFに依らず常時）。
-                aiOnTx(ack = rxBytes > 0, gapMs = if (earlyFrame) 0 else gapMsForRecord, error = false)
+                aiOnTx(ack = acked, gapMs = if (excludeGap) 0 else gapMsForRecord, error = false)
 
                 // 4b. Black box: 実際に送った7バイトpayloadと送信間隔・ACK有無を記録する。
                 // 確保ゼロのプリミティブ配列書き込みなので、最優先送信スレッドでも安全。
@@ -4978,7 +5056,7 @@ class MainActivity : Activity() {
                         SystemClock.elapsedRealtime(),
                         payloadBuffer,
                         gapMsForRecord,
-                        ack = rxBytes > 0,
+                        ack = acked,
                         error = false,
                         marker = false,
                         rssi = lastKnownRssi
@@ -4991,6 +5069,11 @@ class MainActivity : Activity() {
                     lastPayloadUiUpdateMs = nowMs
                     val payloadSnapshot = payloadBuffer.copyOf()
                     val jitterSnapshotMs = maxJitterNs / 1_000_000.0
+                    val ackLabel = if (!radioPacer.pacingActive) {
+                        " / 応答なし:定周期"
+                    } else if (radioPacer.lastAckMs >= 0.0) {
+                        String.format(Locale.US, " / 無線%.0fms 欠%d", radioPacer.lastAckMs, radioPacer.timeouts)
+                    } else ""
                     val txLabel = if (intervalMs == requestedIntervalMs) {
                         "${intervalMs}ms"
                     } else {
@@ -5001,7 +5084,7 @@ class MainActivity : Activity() {
                             updatePayloadOnly(payloadSnapshot, "LIVE TX #$txCount")
                         }
                         if (::sendBadge.isInitialized && isSending && generation == senderGeneration.get()) {
-                            sendBadge.text = "TX: 送信中 ${txLabel} / J±${String.format(Locale.US, "%.1f", jitterSnapshotMs)}ms"
+                            sendBadge.text = "TX: 送信中 ${txLabel} / J±${String.format(Locale.US, "%.1f", jitterSnapshotMs)}ms$ackLabel"
                         }
                     }
                     if (txCount % 100 == 0) maxJitterNs = 0L
@@ -5013,7 +5096,7 @@ class MainActivity : Activity() {
                 if (afterWriteNs >= nextTickNs) {
                     nextTickNs = afterWriteNs + intervalNs
                 }
-                earlyFrame = waitUntilNs(nextTickNs, generation, txStartNs, intervalMs)
+                earlyFrame = waitUntilNs(nextTickNs, generation, txStartNs, intervalMs, rxScratch)
 
             } catch (e: InterruptedException) {
                 break
@@ -5063,6 +5146,7 @@ class MainActivity : Activity() {
                 val linkFailure = consecutiveTxErrors >= TX_MAX_CONSECUTIVE_ERRORS
                 isSending = false
                 savedNavigation.stop()
+                runOnUiThread { updateBucketFollowButton() }
                 anglePresetCommand.stop()
                 mainHandler.post {
                     savedNavigationMap?.clearSelection()
@@ -5090,8 +5174,22 @@ class MainActivity : Activity() {
     }
 
     /** 戻り値: 保存地点/ボタンエッジにより予定より前倒しで抜けたか。 */
-    private fun waitUntilNs(deadlineNs: Long, generation: Int, lastTxStartNs: Long, intervalMs: Long): Boolean {
+    private fun waitUntilNs(deadlineNs: Long, generation: Int, lastTxStartNs: Long, intervalMs: Long, scratch: ByteArray): Boolean {
+        lastWaitRadioLimited = false
         while (isSending && generation == senderGeneration.get()) {
+            // 周期より先に、MU-3が前のフレームを送り終えたか（*DT応答）を待つ。
+            // 応答前に書くとMU-3内に溜まり、無線が遅れたぶん操作の到達が遅れ続ける。
+            // ボタンエッジや保存地点で周期を前倒ししても、この待ちは飛ばさない。
+            if (!radioPacer.ready(SystemClock.elapsedRealtimeNanos())) {
+                synchronized(serialWriteLock) {
+                    val port = serialPort ?: throw IllegalStateException("MU-3 disconnected")
+                    // 5ms刻みで読み、停止要求にすぐ応じる
+                    awaitRadioSlotLocked(port, scratch, 5L) { isSending && generation == senderGeneration.get() }
+                }
+                if (SystemClock.elapsedRealtimeNanos() > deadlineNs) lastWaitRadioLimited = true
+                if (Thread.currentThread().isInterrupted) throw InterruptedException()
+                continue
+            }
             var minimumGapMs = Long.MAX_VALUE
             if (savedNavigation.transmitting) minimumGapMs = stableTxIntervalMs(20L)
             if (inputEdgePending) {
@@ -5187,7 +5285,12 @@ class MainActivity : Activity() {
         val frame = formatMu3Frame(payload)
         synchronized(serialWriteLock) {
             if (serialPort !== port) throw IllegalStateException("MU-3 disconnected")
+            // 連送もMU-3内に溜めない。溜めると非常停止後の次の操作が、
+            // 残ったニュートラル列の無線送信が終わるまで届かなくなる。
+            val scratch = ByteArray(64)
+            awaitRadioSlotLocked(port, scratch, 20L) { serialPort === port }
             port.write(frame.toByteArray(StandardCharsets.US_ASCII), 50)
+            radioPacer.onSent(SystemClock.elapsedRealtimeNanos())
         }
     }
 
@@ -5291,6 +5394,7 @@ class MainActivity : Activity() {
             val n = try { port.read(buf, readTimeoutMs) } catch (e: Exception) { throw e }
             val afterReadMs = SystemClock.elapsedRealtime()
             if (n > 0) {
+                radioPacer.onBytes(buf, n, SystemClock.elapsedRealtimeNanos())
                 for (i in 0 until n) out.add(buf[i])
                 lastRx = afterReadMs
             } else if (out.isNotEmpty() && afterReadMs - lastRx >= 90L) {
@@ -5316,9 +5420,24 @@ class MainActivity : Activity() {
             val readTimeoutMs = remainingMs.coerceAtMost(20L).coerceAtLeast(1L).toInt()
             val n = port.read(scratch, readTimeoutMs)
             if (n <= 0) break
+            radioPacer.onBytes(scratch, n, SystemClock.elapsedRealtimeNanos())
             total += n
         }
         return total
+    }
+
+    /**
+     * 直前の@DTへの*DT応答を待つ。応答・拒否・打ち切りのどれかで戻る。
+     * [stillWanted] が false になったら（停止要求）待つのをやめる。
+     */
+    private fun awaitRadioSlotLocked(port: UsbSerialPort, scratch: ByteArray, maxPollMs: Long, stillWanted: () -> Boolean) {
+        while (stillWanted()) {
+            val now = SystemClock.elapsedRealtimeNanos()
+            if (radioPacer.ready(now)) return
+            val remainingMs = (radioPacer.waitDeadlineNs() - now + 999_999L) / 1_000_000L
+            val n = port.read(scratch, remainingMs.coerceIn(1L, maxPollMs).toInt())
+            if (n > 0) radioPacer.onBytes(scratch, n, SystemClock.elapsedRealtimeNanos())
+        }
     }
 
     private fun drainSerialAvailableLocked(port: UsbSerialPort, durationMs: Int = 80): ByteArray {
@@ -5332,6 +5451,7 @@ class MainActivity : Activity() {
             val readTimeoutMs = remainingMs.coerceAtMost(20L).coerceAtLeast(1L).toInt()
             val n = try { port.read(buf, readTimeoutMs) } catch (e: Exception) { throw e }
             if (n > 0) {
+                radioPacer.onBytes(buf, n, SystemClock.elapsedRealtimeNanos())
                 for (i in 0 until n) out.add(buf[i])
             }
         }

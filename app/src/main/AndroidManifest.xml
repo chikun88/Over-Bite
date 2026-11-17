@@ -9,8 +9,22 @@
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:label="@string/app_name"
-        android:icon="@drawable/ic_launcher"
+        android:icon="@mipmap/ic_launcher"
         android:theme="@style/AppTheme">
+
+        <!-- 起動時に res/raw/splash_video.mp4 を全画面・音声付きで再生してから MainActivity へ遷移する。 -->
+        <activity
+            android:name=".SplashVideoActivity"
+            android:exported="true"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|touchscreen|uiMode|screenLayout|smallestScreenSize"
+            android:theme="@style/SplashTheme"
+            tools:ignore="DiscouragedApi">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
 
         <!-- コントローラー接続(keyboard/navigation)やダークモード切替(uiMode)で
              Activityが再生成されると、onDestroyでMU-3リンクが閉じて送信が止まる。 -->
@@ -20,11 +34,6 @@
             android:screenOrientation="landscape"
             android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|touchscreen|uiMode|screenLayout|smallestScreenSize"
             tools:ignore="DiscouragedApi">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-
             <intent-filter>
                 <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
             </intent-filter>
